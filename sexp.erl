@@ -23,7 +23,11 @@ datum({Token, Rest}) ->
     {token, open, Kind} -> build_list(Kind, false, Rest);
     {token, open_vector} -> 
       {VectorAsList, More} = build_vector(Rest),
-      {list_to_tuple(VectorAsList), More}
+      {list_to_tuple(VectorAsList), More};
+    {token, Q} when (Q == quote) orelse (Q == quasiquote) orelse 
+		    (Q == unquote) orelse (Q == unquote_splice) ->
+      build_quote(Q, Rest);
+    X -> exit({unexpected_token, X})
   end.
 
 build_list(ParenKind, SeenFirst, Input) ->
@@ -49,10 +53,20 @@ build_list(ParenKind, SeenFirst, Input) ->
 build_vector(Input) ->
   case read_token(Input) of
     {{token, close, round}, Rest} -> {[], Rest};
+    {{token, close, square}, _} -> exit(invalid_close_paren);
+    {{token, dot}, _} -> exit(unexpected_dot);
     {Token, Rest} ->
       {Datum, More} = datum({Token, Rest}),
       {Vector, More2} = build_vector(More),
       {[Datum | Vector], More2}
+  end.
+
+build_quote(Quoting, Input) ->
+  case read_token(Input) of
+    eof -> exit(unexpected_eof);
+    {Token, Rest} -> 
+      {Datum, More} = datum({Token, Rest}),
+      {[Quoting,Datum],More}
   end.
 
 read_token([]) -> {eof,[]};
@@ -92,12 +106,14 @@ ignore_line([$\n|Rest]) -> read_token(Rest);
 ignore_line([_C|Rest]) -> ignore_line(Rest).
 
 % TODO read_hash should also handle special names like #\space #\newline
+read_hash([]) -> exit(unexpected_eof);
 read_hash([$(|Rest]) -> {{token, open_vector}, Rest};
 read_hash([$t|Rest]) -> {{token, true}, Rest};
-read_hash([$f|Rest]) -> {{token, false}, Rest}.
+read_hash([$f|Rest]) -> {{token, false}, Rest};
+read_hash([C|_]) -> exit({unexpected_hash_character, C}).
 
 read_unquote([$@|Rest]) -> {{token, unquote_splice}, Rest};
-read_unquote([Rest]) -> {{token, unquote}, Rest}.
+read_unquote(Rest) -> {{token, unquote}, Rest}.
 
 read_dots([]) -> {{token, dot}, []};
 read_dots([C|Rest]) when ?DELIMITER(C) -> {{token, dot}, [C | Rest]};
@@ -154,3 +170,61 @@ read_escaped([$\\|Rest],Data) -> read_string(Rest, [$\\ | Data]);
 read_escaped([$"|Rest],Data) -> read_string(Rest, [$" | Data]);
 read_escaped([$'|Rest],Data) -> read_string(Rest, [$' | Data]);
 read_escaped([C|_Rest],_Data) -> exit({illegal_string_escape, C}).
+
+% Testing
+-define(EXPECT(Test, Reason), expect(catch Test, Reason)).
+
+expect(Result, Expected) ->
+  %io:format("expect(~w, ~w)~n", [Result, Expected]),
+  case Result of
+    {'EXIT', Expected} -> ok;
+    Other -> exit({test_failed, Other, Expected})
+  end.
+
+test() ->
+  % unhandled: +inf, -inf, +foo
+  % unhandled: cases that involve a premature eof
+  % incorrect: #true, #false
+
+  eof = read(""),
+  eof = read("  "),
+  eof = read("; This is a comment"),
+  {"", []} = read("\"\""),
+  {"test", []} = read("\"test\""),
+  ?EXPECT(read("\""), {unterminated_string, []}),
+  ?EXPECT(read("\"test"), {unterminated_string, "test"}),
+
+  {test, []} = read("test"),
+  {[quote,test], []} = read("'test"),
+  {[quasiquote,test], []} = read("`test"),
+  {[unquote,test], []} = read(",test"),
+  {[unquote_splice,test], []} = read(",@test"),
+
+  {[a,b,c], []} = read("(a b c)"),
+  {[a,b|c], []} = read("(a b . c)"),
+  ?EXPECT(read("(a . b . c)"), missing_close_paren),
+  ?EXPECT(read("(foo]"), invalid_close_paren),
+  ?EXPECT(read("[foo)"), invalid_close_paren),
+
+  {{a,b,c}, []} = read("#(a b c)"),
+  ?EXPECT(read("#(a b . c)"), unexpected_dot),
+  ?EXPECT(read("#(foo]"), invalid_close_paren),
+  ?EXPECT(read("#[foo)"), {unexpected_hash_character, $[}),
+  ?EXPECT(read("#"), unexpected_eof),
+
+  {123, []} = read("123"),
+  {3.14159, []} = read("3.14159"),
+  {-135, []} = read("-135"),
+  {246, []} = read("+246"),
+
+  {true, []} = read("#t"),
+  {false, []} = read("#f"),
+
+  {['let', [[x,5]],['+',x,2]], "\n"} =
+  read("
+;; Commented code
+(let ([x 5])
+  (+ x 2))
+"),
+
+  ok.
